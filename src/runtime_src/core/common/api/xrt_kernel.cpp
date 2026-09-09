@@ -64,6 +64,7 @@
 #include <condition_variable>
 #include <chrono>
 #include <cstdarg>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -635,6 +636,7 @@ private:
 // then behavior is undefined.
 class ip_context
 {
+public:
   // class connectivy - Represents argument connectiviy to memory banks
   //
   // The argument connectivity is represented using a compressed bitset
@@ -645,7 +647,6 @@ class ip_context
   // @default_connection: default connectivity for an argument
   class connectivity
   {
-    static constexpr int32_t no_memidx {-1};
     static constexpr size_t max_connections {64};
     std::vector<encoded_bitset<max_connections>> connections; // indexed by argidx
     std::vector<int32_t> default_connection;                  // indexed by argidx
@@ -662,6 +663,8 @@ class ip_context
     }
 
   public:
+    static constexpr int32_t no_memidx {-1};
+
     connectivity() = default;
 
     // @xclbin: meta data
@@ -717,8 +720,6 @@ class ip_context
     }
   };
 
-
-public:
   using access_mode = xrt::kernel::cu_access_mode;
   using slot_id = xrt_core::hwctx_handle::slot_id;
 
@@ -1821,23 +1822,18 @@ private:
     if (!module)
       return nullptr; // applicable only for ELF flows
 
-    // Get control packet data from ELF module configuration
-    // Control packet cache is only applicable for aie2p platform
+    // Get control packet data from ELF — only applicable for aie2p platform
     auto elf_handle = xrt_core::module_int::get_elf_handle(module);
-    auto module_config = elf_handle->get_module_config(id);
-    const auto config = std::get_if<xrt::module_config_aie_gen2>(&module_config);
-    if (!config)
-      return nullptr; // not aie2p platform, no ctrlpkt cache needed
+    if (elf_handle->get_platform() != xrt::elf::platform::aie2p)
+      return nullptr;
 
-    const auto& ctrl_packet = config->ctrl_packet_data;
-
-    if (ctrl_packet.size() == 0)
+    auto ctrlpkt_buf_size = elf_handle->get_ctrl_packet_size(id);
+    if (ctrlpkt_buf_size == 0)
       return nullptr;
 
     // Create mutable copy for buffer cache
-    std::vector<uint8_t> ctrlpkt_data(ctrl_packet.data(),
-                                      ctrl_packet.data() + ctrl_packet.size());
-    auto ctrlpkt_buf_size = ctrlpkt_data.size();
+    std::vector<uint8_t> ctrlpkt_data(ctrlpkt_buf_size);
+    elf_handle->copy_ctrl_packet(id, {reinterpret_cast<std::byte*>(ctrlpkt_data.data()), ctrlpkt_buf_size});
 
     constexpr size_t bytes_per_mb = 1024ULL * 1024ULL;
     static auto pool_memory_size = xrt_core::config::get_run_buffer_pool_memory_mb() * bytes_per_mb;
@@ -2147,11 +2143,20 @@ public:
     // for the xclbin slot, and 8 bits reserved for bo flags.  The latter
     // flags are populated when the xrt::bo object is constructed.
 
+    if (argno < 0 || static_cast<size_t>(argno) >= args.size())
+      throw xrt_core::error(EINVAL, "No such kernel argument at index " + std::to_string(argno)
+                            + " for kernel '" + name + "'");
+
     // Last (for group id) connection of first ip in this kernel
     // The group id can change if cus are trimmed based on argument
     auto& ip = ipctxs.front();  // guaranteed to be non empty
+    auto memidx = ip->arg_memidx(argno);
+    if (memidx == ip_context::connectivity::no_memidx)
+      throw xrt_core::error(EINVAL, "No memory group assigned for global argument at index "
+                            + std::to_string(argno) + " of kernel '" + name + "'");
+
     xcl_bo_flags grp = {0};     // xrt_mem.h
-    grp.bank = ip->arg_memidx(argno);
+    grp.bank = memidx;
     grp.slot = ip->get_slot();
 
     // This function should return uint32_t or some same symbolic type
@@ -3152,7 +3157,12 @@ public:
   }
 
   // abort_coredump_or_noop() - AIE coredump if enabled
-  // Dump core and abort, or do nothing.
+  // Write AIE coredump ELF to the configured file then abort.
+  // std::abort() ensures the OS reclaims driver resources (hw_context, hardware
+  // state) after a timeout. Users who set xrt.ini to capture AIE coredump
+  // would get coredump and don't see the timeout exception message.
+  // The timeout excpetion message is seen only w/o this xrt.ini setting
+  // This coredump functionality is not applicable to non-elf flow
   void
   abort_coredump_or_noop(ert_cmd_state state) const
   {
@@ -3165,12 +3175,22 @@ public:
 
     try {
       auto hwctx = kernel->get_hw_context();
-      auto core = hwctx.get_aie_coredump();  // may throw
+      // Use the ELF from this run's own module
+      // Each ELF has its own UUID; using the run's module ensures the
+      // correct UUID is embedded in the coredump metadata.
+      if (!m_module)
+        throw std::runtime_error("AIE coredump ELF not available: no ELF associated with this run");
+
+      auto elf = xrt::elf{xrt_core::module_int::get_elf_handle(m_module)};
+
+      auto core = xrt_core::hw_context_int::get_aie_coredump_elf(hwctx, elf);
 
       std::ofstream ostr{file, std::ios::binary};
       if (!ostr)
         throw std::runtime_error("Could not open '" + file + "' for writing");
+
       ostr.write(core.data(), static_cast<std::streamsize>(core.size()));
+      ostr.flush();  // flush before abort — destructors do not run after std::abort()
       std::abort();
     }
     catch (const std::exception& ex) {
@@ -5167,7 +5187,16 @@ aie_error_message_v1(const ert_packet* epkt, const std::string& msg,
         << "\nnumber of uC reported = " << std::dec
         << ctx_health->aie4.num_uc;
 
-    for (uint32_t i = 0; i < ctx_health->aie4.num_uc; ++i) {
+    // clamp num_uc to entries that fit in the packet payload; fixed overhead
+    // is version+npu_gen+ctx_state+num_uc+ctx_error_type = 5 uint32_t words
+    constexpr uint32_t aie4_fixed_words = 5;
+    constexpr uint32_t uc_entry_words = sizeof(ert_uc_health_info) / sizeof(uint32_t);
+    const uint32_t max_uc = (epkt->count > aie4_fixed_words)
+      ? (epkt->count - aie4_fixed_words) / uc_entry_words
+      : 0;
+    const uint32_t num_uc = std::min(max_uc, ctx_health->aie4.num_uc);
+
+    for (uint32_t i = 0; i < num_uc; ++i) {
       oss << "\nuc_info[" << i << "]: "
           << "\nuc_idx=0x" << std::setw(indent8) << std::hex
           << ctx_health->aie4.uc_info[i].uc_idx

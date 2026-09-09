@@ -83,11 +83,17 @@ static const std::string test_token_failed = "FAILED";
 static const std::string test_token_passed = "PASSED";
 
 void
-doesTestExist(const std::string& userTestName, std::vector<std::shared_ptr<TestRunner>>& testNames)
+doesTestExist(const std::string& userTestName, const std::vector<std::shared_ptr<TestRunner>>& testNames)
 {
-  const auto iter = std::find_if( testNames.begin(), testNames.end(),
-    [&userTestName](const std::shared_ptr<TestRunner>& testRunner){ 
-      return userTestName == "all" || userTestName == "quick" || userTestName == testRunner->get_name();
+  if (testNames.empty())
+    throw xrt_core::error("No validate tests are available for this device");
+
+  if (userTestName == "all" || userTestName == "quick")
+    return;
+
+  const auto iter = std::find_if(testNames.begin(), testNames.end(),
+    [&userTestName](const std::shared_ptr<TestRunner>& testRunner) {
+      return userTestName == testRunner->get_name();
     });
 
   if (iter == testNames.end())
@@ -302,7 +308,9 @@ run_test_suite_device( const std::shared_ptr<xrt_core::device>& device,
   if (testObjectsToRun.empty())
     throw std::runtime_error("No test given to validate against.");
 
-  auto test_archive = XBU::open_archive(device.get());
+  // Shared ownership: a test that times out keeps running in a detached thread
+  // which may still be using the archive after this function returns.
+  std::shared_ptr<const xrt_core::archive> test_archive = XBU::open_archive(device.get());
 
   get_platform_info(device, ptDeviceInfo, schemaVersion, std::cout);
   std::cout << "-------------------------------------------------------------------------------" << std::endl;
@@ -315,8 +323,8 @@ run_test_suite_device( const std::shared_ptr<xrt_core::device>& device,
     boost::property_tree::ptree ptTest;
     pretty_print_test_desc(testPtr, ptTest, test_idx, std::cout, xq::pcie_bdf::to_string(bdf));
     try {
-      // Call startTest with archive if available, otherwise use standard call; pass iter_count for repeated runs
-      ptTest = test_archive ? testPtr->startTest(device, test_archive.get(), iter_count) : testPtr->startTest(device, nullptr, iter_count);
+      // Archive is null on devices that don't provide one; pass iter_count for repeated runs
+      ptTest = testPtr->startTest(device, test_archive, iter_count);
     } catch (const std::runtime_error& e) {
       std::cout << e.what() << std::endl;
       return test_status::failed;
